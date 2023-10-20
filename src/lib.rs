@@ -20,7 +20,11 @@
 //!   }
 //! }
 //! ````
-use egui::{text::LayoutJob, Context, FontId, Id, Key, Modifiers, TextBuffer, TextEdit, Widget};
+use egui::{
+    text::{CCursor, LayoutJob},
+    text_edit::CCursorRange,
+    Context, FontId, Id, Key, Modifiers, TextBuffer, TextEdit, Widget,
+};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use std::cmp::{min, Reverse};
@@ -131,21 +135,34 @@ where
             text_edit = set_properties(text_edit);
         }
 
-        let text_response = text_edit.ui(ui);
-        state.focused = text_response.has_focus();
+        let mut text_edit_output = text_edit.show(ui);
+        state.focused = text_edit_output.response.has_focus();
+
+        //get last word and its start index
+        let Some(ccr) = text_edit_output.cursor_range else {
+            return text_edit_output.response;
+        };
+
+        let (word_start, word_end) =
+            find_bounding_indices_of_current_word(ccr.primary.pcursor.offset, text_field, " ,-_.");
+        let current_word = &text_field[word_start..word_end];
+
+        if current_word.is_empty() {
+            return text_edit_output.response;
+        }
 
         let matcher = SkimMatcherV2::default().ignore_case();
 
         let mut match_results = search
             .into_iter()
             .filter_map(|s| {
-                let score = matcher.fuzzy_indices(s.as_ref(), text_field.as_str());
+                let score = matcher.fuzzy_indices(s.as_ref(), current_word);
                 score.map(|(score, indices)| (s, score, indices))
             })
             .collect::<Vec<_>>();
         match_results.sort_by_key(|k| Reverse(k.1));
 
-        if text_response.changed()
+        if text_edit_output.response.changed()
             || (state.selected_index.is_some()
                 && state.selected_index.unwrap() >= match_results.len())
         {
@@ -165,9 +182,24 @@ where
             state.selected_index,
             ui.memory(|mem| mem.is_popup_open(id)) && accepted_by_keyboard,
         ) {
-            text_field.replace(match_results[index].0.as_ref())
+            //replace word
+            text_field.replace_range(word_start..word_end, match_results[index].0.as_ref());
+
+            // Create a new selection range
+            let min = CCursor::new(word_start + match_results[index].0.as_ref().len());
+            let max = CCursor::new(word_start + match_results[index].0.as_ref().len());
+            let new_range = CCursorRange::two(min, max);
+
+            // Update the state
+            text_edit_output.state.set_ccursor_range(Some(new_range));
+            // Store the updated state
+            text_edit_output
+                .state
+                .store(ui.ctx(), text_edit_output.response.id);
+
+            text_edit_output.response.request_focus();
         }
-        egui::popup::popup_below_widget(ui, id, &text_response, |ui| {
+        egui::popup::popup_below_widget(ui, id, &text_edit_output.response, |ui| {
             for (i, (output, _, match_indices)) in
                 match_results.iter().take(max_suggestions).enumerate()
             {
@@ -193,7 +225,9 @@ where
                 }
             }
         });
-        if !text_field.as_str().is_empty() && text_response.has_focus() && !match_results.is_empty()
+        if !text_field.as_str().is_empty()
+            && text_edit_output.response.has_focus()
+            && !match_results.is_empty()
         {
             ui.memory_mut(|mem| mem.open_popup(id));
         } else {
@@ -206,7 +240,7 @@ where
 
         state.store(ui.ctx(), id);
 
-        text_response
+        text_edit_output.response
     }
 }
 
@@ -354,4 +388,20 @@ mod test {
         assert_eq!(sec4.byte_range, 5..7);
         assert_eq!(sec4.format.color, egui::Color32::RED);
     }
+}
+
+pub fn find_bounding_indices_of_current_word(
+    ind: usize,
+    text: &str,
+    delimiters: &str,
+) -> (usize, usize) {
+    let mut start = ind;
+    let mut end = ind;
+    while start > 0 && !delimiters.contains(text.chars().nth(start - 1).unwrap()) {
+        start -= 1;
+    }
+    while end < text.len() && !delimiters.contains(text.chars().nth(end).unwrap()) {
+        end += 1;
+    }
+    (start, end)
 }
